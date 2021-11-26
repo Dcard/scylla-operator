@@ -243,25 +243,29 @@ func (scc *Controller) syncServices(
 					Name:      svc.Name,
 				},
 			}
-			klog.V(2).InfoS("Deleting the Pod to replace member",
-				"ScyllaCluster", klog.KObj(sc),
-				"Service", klog.KObj(svc),
-				"Pod", klog.KObj(podMeta),
-			)
-			// TODO: Revert back to eviction when it's fixed in kubernetes 1.19.z (#732)
-			//       (https://github.com/kubernetes/kubernetes/issues/103970)
-			err = scc.kubeClient.CoreV1().Pods(podMeta.Namespace).Delete(ctx, podMeta.Name, metav1.DeleteOptions{
-				PropagationPolicy: &backgroundPropagationPolicy,
-			})
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					klog.V(4).InfoS("Pod not found", "Pod", klog.ObjectRef{Namespace: svc.Namespace, Name: svc.Name})
-				} else {
-					resourceapply.ReportDeleteEvent(scc.eventRecorder, podMeta, err)
-					return status, err
+
+			pod, err := scc.kubeClient.CoreV1().Pods(podMeta.Namespace).Get(ctx, podMeta.Name, metav1.GetOptions{})
+			if err == nil && pod.Status.Phase == corev1.PodPending {
+				klog.V(2).InfoS("Deleting the pending Pod to replace member",
+					"ScyllaCluster", klog.KObj(sc),
+					"Service", klog.KObj(svc),
+					"Pod", klog.KObj(podMeta),
+				)
+				// TODO: Revert back to eviction when it's fixed in kubernetes 1.19.z (#732)
+				//       (https://github.com/kubernetes/kubernetes/issues/103970)
+				err = scc.kubeClient.CoreV1().Pods(podMeta.Namespace).Delete(ctx, podMeta.Name, metav1.DeleteOptions{
+					PropagationPolicy: &backgroundPropagationPolicy,
+				})
+				if err != nil {
+					if apierrors.IsNotFound(err) {
+						klog.V(4).InfoS("Pod not found", "Pod", klog.ObjectRef{Namespace: svc.Namespace, Name: svc.Name})
+					} else {
+						resourceapply.ReportDeleteEvent(scc.eventRecorder, podMeta, err)
+						return status, err
+					}
 				}
+				resourceapply.ReportDeleteEvent(scc.eventRecorder, podMeta, nil)
 			}
-			resourceapply.ReportDeleteEvent(scc.eventRecorder, podMeta, nil)
 		} else {
 			// Member is being replaced. Wait for readiness and clear the replace label.
 
