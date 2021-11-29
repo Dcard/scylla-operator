@@ -3,16 +3,17 @@ package orphanedpv
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	scyllav1 "github.com/scylladb/scylla-operator/pkg/api/scylla/v1"
 	"github.com/scylladb/scylla-operator/pkg/controller/helpers"
 	"github.com/scylladb/scylla-operator/pkg/naming"
+	"github.com/scylladb/scylla-operator/pkg/resourceapply"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/klog/v2"
@@ -144,19 +145,76 @@ func (opc *Controller) sync(ctx context.Context, key string) error {
 
 		klog.V(2).InfoS("PV is verified as orphaned.", "ScyllaCluster", sc, "PV", klog.KObj(pi.PV))
 
-		_, err = opc.kubeClient.CoreV1().Services(sc.Namespace).Patch(
-			ctx,
-			pi.ServiceName,
-			types.MergePatchType,
-			[]byte(fmt.Sprintf(`{"metadata": {"labels": {%q: ""} } }`, naming.ReplaceLabel)),
-			metav1.PatchOptions{},
-		)
-		if err != nil {
-			errs = append(errs, err)
+		backgroundPropagationPolicy := metav1.DeletePropagationBackground
+
+		if pi.PV.Spec.ClaimRef == nil {
 			continue
 		}
 
-		klog.V(2).InfoS("Marked service for replacement", "ScyllaCluster", sc, "Service", pi.ServiceName)
+		pvc := pi.PV.Spec.ClaimRef
+
+		// First, Delete the PVC if it exists.
+		// The PVC has finalizer protection so it will wait for the pod to be deleted.
+		// We can't do it the other way around or the pod could be recreated before we delete the PVC.
+		pvcMeta := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: pvc.Namespace,
+				Name:      pvc.Name,
+			},
+		}
+		klog.V(2).InfoS("Deleting the PVC to replace member",
+			"ScyllaCluster", klog.KObj(sc),
+			"PVC", klog.KObj(pvcMeta),
+		)
+		err = opc.kubeClient.CoreV1().PersistentVolumeClaims(pvcMeta.Namespace).Delete(ctx, pvcMeta.Name, metav1.DeleteOptions{
+			PropagationPolicy: &backgroundPropagationPolicy,
+		})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				klog.V(4).InfoS("PVC not found", "PVC", klog.KObj(pvcMeta))
+			} else {
+				resourceapply.ReportDeleteEvent(opc.eventRecorder, pvcMeta, err)
+				return err
+			}
+		}
+		resourceapply.ReportDeleteEvent(opc.eventRecorder, pvcMeta, nil)
+
+		// Hack: Sleeps are terrible thing to in sync logic but this compensates for a broken
+		// StatefulSet controller in Kubernetes. StatefulSet doesn't reconcile PVCs and decides
+		// it's presence only from its cache, and never recreates it if it's missing, only when it
+		// creates the pod. This gives StatefulSet controller a chance to see the PVC was deleted
+		// before deleting the pod.
+		time.Sleep(10 * time.Second)
+
+		// Evict the Pod if it exists.
+		podMeta := &corev1.PersistentVolumeClaim{
+			ObjectMeta: metav1.ObjectMeta{
+				Namespace: pvc.Namespace,
+				Name:      strings.TrimPrefix(pvc.Name, "data-"),
+			},
+		}
+
+		pod, err := opc.kubeClient.CoreV1().Pods(podMeta.Namespace).Get(ctx, podMeta.Name, metav1.GetOptions{})
+		if err == nil && pod.Status.Phase == corev1.PodPending {
+			klog.V(2).InfoS("Deleting the pending Pod to replace member",
+				"ScyllaCluster", klog.KObj(sc),
+				"Pod", klog.KObj(podMeta),
+			)
+			// TODO: Revert back to eviction when it's fixed in kubernetes 1.19.z (#732)
+			//       (https://github.com/kubernetes/kubernetes/issues/103970)
+			err = opc.kubeClient.CoreV1().Pods(podMeta.Namespace).Delete(ctx, podMeta.Name, metav1.DeleteOptions{
+				PropagationPolicy: &backgroundPropagationPolicy,
+			})
+			if err != nil {
+				if apierrors.IsNotFound(err) {
+					klog.V(4).InfoS("Pod not found", "Pod", klog.ObjectRef{Namespace: namespace, Name: strings.TrimPrefix(pvc.Name, "data-")})
+				} else {
+					resourceapply.ReportDeleteEvent(opc.eventRecorder, podMeta, err)
+					return err
+				}
+			}
+			resourceapply.ReportDeleteEvent(opc.eventRecorder, podMeta, nil)
+		}
 	}
 
 	err = utilerrors.NewAggregate(errs)

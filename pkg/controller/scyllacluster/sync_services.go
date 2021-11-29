@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"regexp"
 	"strconv"
-	"time"
 
 	scyllav1 "github.com/scylladb/scylla-operator/pkg/api/scylla/v1"
 	controllerhelpers "github.com/scylladb/scylla-operator/pkg/controller/helpers"
@@ -198,73 +197,6 @@ func (scc *Controller) syncServices(
 
 				// Make sure the address is stored before proceeding further.
 				return status, nil
-			}
-
-			backgroundPropagationPolicy := metav1.DeletePropagationBackground
-
-			// First, Delete the PVC if it exists.
-			// The PVC has finalizer protection so it will wait for the pod to be deleted.
-			// We can't do it the other way around or the pod could be recreated before we delete the PVC.
-			pvcMeta := &corev1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: svc.Namespace,
-					Name:      naming.PVCNameForPod(svc.Name),
-				},
-			}
-			klog.V(2).InfoS("Deleting the PVC to replace member",
-				"ScyllaCluster", klog.KObj(sc),
-				"Service", klog.KObj(svc),
-				"PVC", klog.KObj(pvcMeta),
-			)
-			err = scc.kubeClient.CoreV1().PersistentVolumeClaims(pvcMeta.Namespace).Delete(ctx, pvcMeta.Name, metav1.DeleteOptions{
-				PropagationPolicy: &backgroundPropagationPolicy,
-			})
-			if err != nil {
-				if apierrors.IsNotFound(err) {
-					klog.V(4).InfoS("PVC not found", "PVC", klog.KObj(pvcMeta))
-				} else {
-					resourceapply.ReportDeleteEvent(scc.eventRecorder, pvcMeta, err)
-					return status, err
-				}
-			}
-			resourceapply.ReportDeleteEvent(scc.eventRecorder, pvcMeta, nil)
-
-			// Hack: Sleeps are terrible thing to in sync logic but this compensates for a broken
-			// StatefulSet controller in Kubernetes. StatefulSet doesn't reconcile PVCs and decides
-			// it's presence only from its cache, and never recreates it if it's missing, only when it
-			// creates the pod. This gives StatefulSet controller a chance to see the PVC was deleted
-			// before deleting the pod.
-			time.Sleep(10 * time.Second)
-
-			// Evict the Pod if it exists.
-			podMeta := &corev1.PersistentVolumeClaim{
-				ObjectMeta: metav1.ObjectMeta{
-					Namespace: svc.Namespace,
-					Name:      svc.Name,
-				},
-			}
-
-			pod, err := scc.kubeClient.CoreV1().Pods(podMeta.Namespace).Get(ctx, podMeta.Name, metav1.GetOptions{})
-			if err == nil && pod.Status.Phase == corev1.PodPending {
-				klog.V(2).InfoS("Deleting the pending Pod to replace member",
-					"ScyllaCluster", klog.KObj(sc),
-					"Service", klog.KObj(svc),
-					"Pod", klog.KObj(podMeta),
-				)
-				// TODO: Revert back to eviction when it's fixed in kubernetes 1.19.z (#732)
-				//       (https://github.com/kubernetes/kubernetes/issues/103970)
-				err = scc.kubeClient.CoreV1().Pods(podMeta.Namespace).Delete(ctx, podMeta.Name, metav1.DeleteOptions{
-					PropagationPolicy: &backgroundPropagationPolicy,
-				})
-				if err != nil {
-					if apierrors.IsNotFound(err) {
-						klog.V(4).InfoS("Pod not found", "Pod", klog.ObjectRef{Namespace: svc.Namespace, Name: svc.Name})
-					} else {
-						resourceapply.ReportDeleteEvent(scc.eventRecorder, podMeta, err)
-						return status, err
-					}
-				}
-				resourceapply.ReportDeleteEvent(scc.eventRecorder, podMeta, nil)
 			}
 		} else {
 			// Member is being replaced. Wait for readiness and clear the replace label.
