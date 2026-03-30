@@ -3,17 +3,18 @@ package packfile
 import (
 	"bufio"
 	"bytes"
-	"compress/zlib"
+	"crypto"
+	"errors"
 	"fmt"
-	"hash"
+	gohash "hash"
 	"hash/crc32"
 	"io"
-	stdioutil "io/ioutil"
-	"sync"
 
 	"github.com/go-git/go-git/v5/plumbing"
+	"github.com/go-git/go-git/v5/plumbing/hash"
 	"github.com/go-git/go-git/v5/utils/binary"
 	"github.com/go-git/go-git/v5/utils/ioutil"
+	"github.com/go-git/go-git/v5/utils/sync"
 )
 
 var (
@@ -26,6 +27,8 @@ var (
 	ErrUnsupportedVersion = NewError("unsupported packfile version")
 	// ErrSeekNotSupported returned if seek is not support
 	ErrSeekNotSupported = NewError("not seek support")
+	// ErrMalformedPackFile is returned by the parser when the pack file is corrupted.
+	ErrMalformedPackFile = errors.New("malformed PACK file")
 )
 
 // ObjectHeader contains the information related to the object, this information
@@ -39,8 +42,9 @@ type ObjectHeader struct {
 }
 
 type Scanner struct {
-	r   *scannerReader
-	crc hash.Hash32
+	r          *scannerReader
+	crc        gohash.Hash32
+	packHasher hash.Hash
 
 	// pendingObject is used to detect if an object has been read, or still
 	// is waiting to be read
@@ -58,10 +62,12 @@ func NewScanner(r io.Reader) *Scanner {
 	_, ok := r.(io.ReadSeeker)
 
 	crc := crc32.NewIEEE()
+	hasher := hash.New(crypto.SHA1)
 	return &Scanner{
-		r:          newScannerReader(r, crc),
+		r:          newScannerReader(r, io.MultiWriter(crc, hasher)),
 		crc:        crc,
 		IsSeekable: ok,
+		packHasher: hasher,
 	}
 }
 
@@ -70,6 +76,7 @@ func (s *Scanner) Reset(r io.Reader) {
 
 	s.r.Reset(r)
 	s.crc.Reset()
+	s.packHasher.Reset()
 	s.IsSeekable = ok
 	s.pendingObject = nil
 	s.version = 0
@@ -114,9 +121,9 @@ func (s *Scanner) Header() (version, objects uint32, err error) {
 	return
 }
 
-// readSignature reads an returns the signature field in the packfile.
+// readSignature reads a returns the signature field in the packfile.
 func (s *Scanner) readSignature() ([]byte, error) {
-	var sig = make([]byte, 4)
+	sig := make([]byte, 4)
 	if _, err := io.ReadFull(s.r, sig); err != nil {
 		return []byte{}, err
 	}
@@ -243,7 +250,7 @@ func (s *Scanner) discardObjectIfNeeded() error {
 	}
 
 	h := s.pendingObject
-	n, _, err := s.NextObject(stdioutil.Discard)
+	n, _, err := s.NextObject(io.Discard)
 	if err != nil {
 		return err
 	}
@@ -320,27 +327,35 @@ func (s *Scanner) NextObject(w io.Writer) (written int64, crc32 uint32, err erro
 	return
 }
 
+// ReadObject returns a reader for the object content and an error
+func (s *Scanner) ReadObject() (io.ReadCloser, error) {
+	s.pendingObject = nil
+	zr, err := sync.GetZlibReader(s.r)
+	if err != nil {
+		return nil, fmt.Errorf("zlib reset error: %s", err)
+	}
+
+	return ioutil.NewReadCloserWithCloser(zr.Reader, func() error {
+		sync.PutZlibReader(zr)
+		return nil
+	}), nil
+}
+
 // ReadRegularObject reads and write a non-deltified object
 // from it zlib stream in an object entry in the packfile.
 func (s *Scanner) copyObject(w io.Writer) (n int64, err error) {
-	zr := zlibReaderPool.Get().(io.ReadCloser)
-	defer zlibReaderPool.Put(zr)
+	zr, err := sync.GetZlibReader(s.r)
+	defer sync.PutZlibReader(zr)
 
-	if err = zr.(zlib.Resetter).Reset(s.r, nil); err != nil {
+	if err != nil {
 		return 0, fmt.Errorf("zlib reset error: %s", err)
 	}
 
-	defer ioutil.CheckClose(zr, &err)
-	buf := byteSlicePool.Get().([]byte)
-	n, err = io.CopyBuffer(w, zr, buf)
-	byteSlicePool.Put(buf)
+	defer ioutil.CheckClose(zr.Reader, &err)
+	buf := sync.GetByteSlice()
+	n, err = io.CopyBuffer(w, zr.Reader, *buf)
+	sync.PutByteSlice(buf)
 	return
-}
-
-var byteSlicePool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, 32*1024)
-	},
 }
 
 // SeekFromStart sets a new offset from start, returns the old position before
@@ -367,14 +382,26 @@ func (s *Scanner) Checksum() (plumbing.Hash, error) {
 		return plumbing.ZeroHash, err
 	}
 
-	return binary.ReadHash(s.r)
+	s.r.Flush()
+	actual := plumbing.Hash(s.packHasher.Sum(nil))
+	packChecksum, err := binary.ReadHash(s.r)
+	if err != nil {
+		return plumbing.ZeroHash, err
+	}
+
+	if actual != packChecksum {
+		return plumbing.ZeroHash, fmt.Errorf("%w: checksum mismatch: %q instead of %q", ErrMalformedPackFile, packChecksum, actual)
+	}
+
+	return packChecksum, nil
 }
 
 // Close reads the reader until io.EOF
 func (s *Scanner) Close() error {
-	buf := byteSlicePool.Get().([]byte)
-	_, err := io.CopyBuffer(stdioutil.Discard, s.r, buf)
-	byteSlicePool.Put(buf)
+	buf := sync.GetByteSlice()
+	_, err := io.CopyBuffer(io.Discard, s.r, *buf)
+	sync.PutByteSlice(buf)
+
 	return err
 }
 
@@ -384,26 +411,26 @@ func (s *Scanner) Flush() error {
 }
 
 // scannerReader has the following characteristics:
-// - Provides an io.SeekReader impl for bufio.Reader, when the underlying
-//   reader supports it.
-// - Keeps track of the current read position, for when the underlying reader
-//   isn't an io.SeekReader, but we still want to know the current offset.
-// - Writes to the hash writer what it reads, with the aid of a smaller buffer.
-//   The buffer helps avoid a performance penality for performing small writes
-//   to the crc32 hash writer.
+//   - Provides an io.SeekReader impl for bufio.Reader, when the underlying
+//     reader supports it.
+//   - Keeps track of the current read position, for when the underlying reader
+//     isn't an io.SeekReader, but we still want to know the current offset.
+//   - Writes to the hash writer what it reads, with the aid of a smaller buffer.
+//     The buffer helps avoid a performance penalty for performing small writes
+//     to the crc32 hash writer.
 type scannerReader struct {
 	reader io.Reader
-	crc    io.Writer
+	writer io.Writer
 	rbuf   *bufio.Reader
 	wbuf   *bufio.Writer
 	offset int64
 }
 
-func newScannerReader(r io.Reader, h io.Writer) *scannerReader {
+func newScannerReader(r io.Reader, w io.Writer) *scannerReader {
 	sr := &scannerReader{
-		rbuf: bufio.NewReader(nil),
-		wbuf: bufio.NewWriterSize(nil, 64),
-		crc:  h,
+		rbuf:   bufio.NewReader(nil),
+		wbuf:   bufio.NewWriterSize(nil, 64),
+		writer: w,
 	}
 	sr.Reset(r)
 
@@ -413,7 +440,7 @@ func newScannerReader(r io.Reader, h io.Writer) *scannerReader {
 func (r *scannerReader) Reset(reader io.Reader) {
 	r.reader = reader
 	r.rbuf.Reset(r.reader)
-	r.wbuf.Reset(r.crc)
+	r.wbuf.Reset(r.writer)
 
 	r.offset = 0
 	if seeker, ok := r.reader.(io.ReadSeeker); ok {
