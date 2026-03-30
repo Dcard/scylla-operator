@@ -3,12 +3,14 @@ package dotgit
 import (
 	"fmt"
 	"io"
+	"os"
 	"sync/atomic"
 
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/format/idxfile"
 	"github.com/go-git/go-git/v5/plumbing/format/objfile"
 	"github.com/go-git/go-git/v5/plumbing/format/packfile"
+	"github.com/go-git/go-git/v5/plumbing/hash"
 
 	"github.com/go-git/go-billy/v5"
 )
@@ -136,14 +138,22 @@ func (w *PackWriter) save() error {
 	}
 
 	if err := w.encodeIdx(idx); err != nil {
+		_ = idx.Close()
 		return err
 	}
 
 	if err := idx.Close(); err != nil {
 		return err
 	}
+	fixPermissions(w.fs, fmt.Sprintf("%s.idx", base))
 
-	return w.fs.Rename(w.fw.Name(), fmt.Sprintf("%s.pack", base))
+	packPath := fmt.Sprintf("%s.pack", base)
+	if err := w.fs.Rename(w.fw.Name(), packPath); err != nil {
+		return err
+	}
+	fixPermissions(w.fs, packPath)
+
+	return nil
 }
 
 func (w *PackWriter) encodeIdx(writer io.Writer) error {
@@ -277,8 +287,20 @@ func (w *ObjectWriter) Close() error {
 }
 
 func (w *ObjectWriter) save() error {
-	hash := w.Hash().String()
-	file := w.fs.Join(objectsPath, hash[0:2], hash[2:40])
+	hex := w.Hash().String()
+	file := w.fs.Join(objectsPath, hex[0:2], hex[2:hash.HexSize])
 
-	return w.fs.Rename(w.f.Name(), file)
+	// Loose objects are content addressable, if they already exist
+	// we can safely delete the temporary file and short-circuit the
+	// operation.
+	if _, err := w.fs.Stat(file); err == nil || os.IsExist(err) {
+		return w.fs.Remove(w.f.Name())
+	}
+
+	if err := w.fs.Rename(w.f.Name(), file); err != nil {
+		return err
+	}
+	fixPermissions(w.fs, file)
+
+	return nil
 }
